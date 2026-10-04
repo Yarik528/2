@@ -8,7 +8,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.messenger.local"
+        applicationId = "com.example.wifichat"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
@@ -22,6 +22,16 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.4"
     }
+
+    // 👇 ВОТ ЭТО МЫ ДОБАВИЛИ, ЧТОБЫ ПОЧИНИТЬ ОШИБКУ
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+    // 👆 ДОБАВИЛИ ДО СЮДА
 }
 
 dependencies {
@@ -30,4 +40,5 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
     implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.compose.material:material-icons-extended")
 }
