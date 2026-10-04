@@ -8,7 +8,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.wifichat"
+        applicationId = "com.local.messenger"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
