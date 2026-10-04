@@ -5,18 +5,20 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,23 +26,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import coil.compose.rememberAsyncImagePainter
+import kotlinx.coroutines.launch
 import java.io.File
 
 class MainActivity : ComponentActivity() {
-    
-    // Используем viewModels() для Activity
     private val vm: ChatViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Запрос разрешений для Android 13+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(Manifest.permission.READ_MEDIA_IMAGES), 100)
@@ -89,10 +89,23 @@ fun ConnectionScreen(ipInput: String, onIpChange: (String) -> Unit, onStartHost:
 fun ChatScreen(viewModel: ChatViewModel) {
     val messages by viewModel.messages.collectAsState()
     var inputText by remember { mutableStateOf("") }
+    
+    // 1. СОСТОЯНИЕ СКРОЛЛА ДЛЯ АВТОПРОКРУТКИ
+    val listState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
 
-    // Лаунчер выбора фото внутри Compose
-    val pickImageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+    // 2. УНИВЕРСАЛЬНЫЙ ЛАУНЧЕР ДЛЯ ЛЮБЫХ ФАЙЛОВ
+    val pickFileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
         uri?.let { viewModel.sendFile(it) }
+    }
+
+    // 3. АВТОМАТИЧЕСКАЯ ПРОКРУТКА ВНИЗ ПРИ НОВОМ СООБЩЕНИИ
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            listState.animateScrollToItem(messages.size - 1)
+        }
     }
 
     Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(top = 40.dp)) {
@@ -100,13 +113,19 @@ fun ChatScreen(viewModel: ChatViewModel) {
             Text("🟢 Подключено | Локальный чат", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
         }
 
-        LazyColumn(Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // Передаем listState в LazyColumn
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 8.dp), 
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             items(messages) { msg -> MessageBubble(msg) }
         }
 
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             
-            IconButton(onClick = { pickImageLauncher.launch("image/*") }) {
+            // Кнопка теперь открывает любые файлы
+            IconButton(onClick = { pickFileLauncher.launch(arrayOf("*/*")) }) {
                 Icon(Icons.Default.AttachFile, contentDescription = "Attach", tint = Color.Cyan, modifier = Modifier.size(30.dp))
             }
 
@@ -136,15 +155,43 @@ fun MessageBubble(message: Message) {
                 shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = if (message.isMine) 16.dp else 4.dp, bottomEnd = if (message.isMine) 4.dp else 16.dp)
             ).padding(12.dp)
         ) {
-            if (message.imageUri != null) {
-                Image(
-                    painter = rememberAsyncImagePainter(File(message.imageUri)),
-                    contentDescription = "Image",
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp),
-                    contentScale = ContentScale.Crop
-                )
-            } else {
-                Text(text = message.text ?: "", color = Color.White, fontSize = 16.sp)
+            when {
+                // Если это картинка (jpg, png, webp) - показываем изображение
+                message.imageUri != null && (message.imageUri.endsWith(".jpg", true) || 
+                                             message.imageUri.endsWith(".jpeg", true) || 
+                                             message.imageUri.endsWith(".png", true) || 
+                                             message.imageUri.endsWith(".webp", true)) -> {
+                    Image(
+                        painter = rememberAsyncImagePainter(File(message.imageUri)),
+                        contentDescription = "Image",
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+                // Если это другой файл (pdf, apk, zip и т.д.) - показываем иконку и имя
+                message.imageUri != null -> {
+                    val fileName = File(message.imageUri).name
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Description, 
+                            contentDescription = "File", 
+                            tint = Color.White,
+                            modifier = Modifier.size(32.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = fileName, 
+                            color = Color.White, 
+                            fontSize = 14.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                // Обычный текст
+                else -> {
+                    Text(text = message.text ?: "", color = Color.White, fontSize = 16.sp)
+                }
             }
         }
     }
