@@ -27,7 +27,6 @@ class ChatViewModel : ViewModel() {
     private var serverSocket: ServerSocket? = null
     private var clientSocket: Socket? = null
     
-    // Используем потоки байтов напрямую, а не PrintWriter
     private var outputStream: OutputStream? = null
     private var inputStream: InputStream? = null
     
@@ -38,34 +37,29 @@ class ChatViewModel : ViewModel() {
         appContext = context.applicationContext
     }
 
-    // --- ОТПРАВКА ФАЙЛА ---
     fun sendFile(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val inputStreamFile = appContext.contentResolver.openInputStream(uri) ?: return@launch
                 val bytes = inputStreamFile.use { it.readBytes() }
                 
-                // Получаем имя файла
                 var fileName = "photo_${System.currentTimeMillis()}.jpg"
                 appContext.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
                     if (cursor.moveToFirst()) fileName = cursor.getString(0)
                 }
 
-                // 1. Показываем у себя
                 withContext(Dispatchers.Main) {
-                    // Сохраняем локально, чтобы отобразить
                     val localFile = saveFileFromBytes(bytes, fileName)
                     addMessage(null, true, localFile.absolutePath)
                 }
 
-                // 2. Отправляем по сети
-                if (outStream != null) {
+                // ИСПРАВЛЕНО: outputStream вместо outStream
+                if (outputStream != null) {
                     val header = "[FILE]$fileName|${bytes.size}\n"
                     outputStream?.write(header.toByteArray(Charsets.UTF_8))
                     outputStream?.write(bytes)
                     outputStream?.flush()
                 } else if (isBotActive) {
-                    // Эмуляция бота: возвращаем картинку обратно через 1 сек
                     delay(1000)
                     withContext(Dispatchers.Main) {
                         val botFile = saveFileFromBytes(bytes, "bot_$fileName")
@@ -78,14 +72,12 @@ class ChatViewModel : ViewModel() {
         }
     }
 
-    // Сохранение байтов во внутреннюю память приложения
     private fun saveFileFromBytes(bytes: ByteArray, fileName: String): File {
         val file = File(appContext.filesDir, fileName)
         file.outputStream().use { it.write(bytes) }
         return file
     }
 
-    // --- ЛОГИКА СЕРВЕРА (ХОСТ) ---
     fun startAsHost() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -130,7 +122,6 @@ class ChatViewModel : ViewModel() {
         }
     }
 
-    // --- ЛОГИКА КЛИЕНТА ---
     fun startAsClient(hostIp: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -156,7 +147,6 @@ class ChatViewModel : ViewModel() {
         inputStream = BufferedInputStream(socket.getInputStream())
     }
 
-    // --- ЧТЕНИЕ СЕТИ (ТЕКСТ И ФАЙЛЫ) ---
     private suspend fun listenForMessages(socket: Socket) {
         val reader = BufferedReader(InputStreamReader(inputStream))
         try {
@@ -164,12 +154,10 @@ class ChatViewModel : ViewModel() {
                 val line = reader.readLine() ?: break
                 
                 if (line.startsWith("[FILE]")) {
-                    // Формат: [FILE]name.jpg|12345
                     val info = line.removePrefix("[FILE]").split("|")
                     val fileName = info[0]
                     val size = info[1].toInt()
                     
-                    // Читаем ровно size байт
                     val buffer = ByteArray(size)
                     var bytesRead = 0
                     while (bytesRead < size) {
@@ -183,7 +171,6 @@ class ChatViewModel : ViewModel() {
                         addMessage(null, false, file.absolutePath)
                     }
                 } else {
-                    // Обычный текст
                     withContext(Dispatchers.Main) {
                         addMessage(line, false)
                     }
@@ -193,7 +180,7 @@ class ChatViewModel : ViewModel() {
         } finally {
             withContext(Dispatchers.Main) {
                 _isConnected.value = false
-                addMessage(" Соединение разорвано.", false)
+                addMessage("⚠️ Соединение разорвано.", false)
             }
         }
     }
