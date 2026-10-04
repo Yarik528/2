@@ -2,6 +2,7 @@ package com.example.wifichat
 
 import android.content.Context
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -10,11 +11,21 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.*
+import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
 
-data class Message(val text: String?, val isMine: Boolean, val imageUri: String? = null)
+data class Message(
+    val text: String?,
+    val isMine: Boolean,
+    val filePath: String? = null,
+    val fileName: String? = null,
+    val fileSize: Long = 0L
+)
 
 class ChatViewModel : ViewModel() {
 
@@ -26,10 +37,8 @@ class ChatViewModel : ViewModel() {
 
     private var serverSocket: ServerSocket? = null
     private var clientSocket: Socket? = null
-    
     private var outputStream: OutputStream? = null
-    private var inputStream: InputStream? = null
-    
+
     private var isBotActive = false
     private lateinit var appContext: Context
 
@@ -37,33 +46,40 @@ class ChatViewModel : ViewModel() {
         appContext = context.applicationContext
     }
 
+    // ===== ОТПРАВКА ЛЮБОГО ФАЙЛА (фото, видео, документы) =====
     fun sendFile(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val inputStreamFile = appContext.contentResolver.openInputStream(uri) ?: return@launch
-                val bytes = inputStreamFile.use { it.readBytes() }
-                
-                var fileName = "photo_${System.currentTimeMillis()}.jpg"
-                appContext.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                    if (cursor.moveToFirst()) fileName = cursor.getString(0)
-                }
+                val fileName = getFileName(uri)
+                val localFile = File(appContext.filesDir, fileName)
+
+                // Сохраняем у себя, чтобы показать в чате
+                val size = appContext.contentResolver.openInputStream(uri)?.use { input ->
+                    localFile.outputStream().use { out -> input.copyTo(out) }
+                    localFile.length()
+                } ?: return@launch
 
                 withContext(Dispatchers.Main) {
-                    val localFile = saveFileFromBytes(bytes, fileName)
-                    addMessage(null, true, localFile.absolutePath)
+                    addMessage(null, true, localFile.absolutePath, fileName, size)
                 }
 
-                // ИСПРАВЛЕНО: outputStream вместо outStream
                 if (outputStream != null) {
-                    val header = "[FILE]$fileName|${bytes.size}\n"
+                    // Реальная отправка: заголовок + байты частями (не грузим всё в память)
+                    val header = "[FILE]$fileName|$size\n"
                     outputStream?.write(header.toByteArray(Charsets.UTF_8))
-                    outputStream?.write(bytes)
+                    localFile.inputStream().use { input ->
+                        val buf = ByteArray(8192)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n == -1) break
+                            outputStream?.write(buf, 0, n)
+                        }
+                    }
                     outputStream?.flush()
                 } else if (isBotActive) {
                     delay(1000)
                     withContext(Dispatchers.Main) {
-                        val botFile = saveFileFromBytes(bytes, "bot_$fileName")
-                        addMessage("🤖 Бот: Классное фото! Лови обратно.", false, botFile.absolutePath)
+                        addMessage("🤖 Бот: получил '${fileName}' (${formatSize(size)}). Лови обратно!", false, localFile.absolutePath, fileName, size)
                     }
                 }
             } catch (e: Exception) {
@@ -72,12 +88,24 @@ class ChatViewModel : ViewModel() {
         }
     }
 
-    private fun saveFileFromBytes(bytes: ByteArray, fileName: String): File {
-        val file = File(appContext.filesDir, fileName)
-        file.outputStream().use { it.write(bytes) }
-        return file
+    private fun getFileName(uri: Uri): String {
+        var name: String? = null
+        appContext.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) name = cursor.getString(0)
+        }
+        return sanitize(name ?: "file_${System.currentTimeMillis()}")
     }
 
+    private fun sanitize(name: String): String =
+        name.replace("|", "_").replace("\n", "_").replace("\r", "_").replace("/", "_")
+
+    fun formatSize(bytes: Long): String = when {
+        bytes < 1024 -> "$bytes Б"
+        bytes < 1024 * 1024 -> "${bytes / 1024} КБ"
+        else -> String.format("%.1f МБ", bytes / (1024.0 * 1024.0))
+    }
+
+    // ===== СЕРВЕР (ХОСТ) =====
     fun startAsHost() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -101,7 +129,7 @@ class ChatViewModel : ViewModel() {
                 if (clientSocket == null && outputStream == null) {
                     isBotActive = true
                     withContext(Dispatchers.Main) {
-                        addMessage("🤖 Бот активен. Можешь слать текст и картинки!", false)
+                        addMessage("🤖 Бот активен. Можешь слать текст и любые файлы!", false)
                     }
                     launch {
                         messages.collect { list ->
@@ -122,6 +150,7 @@ class ChatViewModel : ViewModel() {
         }
     }
 
+    // ===== КЛИЕНТ =====
     fun startAsClient(hostIp: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -144,36 +173,46 @@ class ChatViewModel : ViewModel() {
 
     private fun setupStreams(socket: Socket) {
         outputStream = BufferedOutputStream(socket.getOutputStream())
-        inputStream = BufferedInputStream(socket.getInputStream())
     }
 
+    // Читаем строку ПОБАЙТОВО (без BufferedReader), чтобы не ломать передачу файлов
+    private fun readLineRaw(input: InputStream): String? {
+        val buffer = ByteArrayOutputStream()
+        while (true) {
+            val b = input.read()
+            if (b == -1) return if (buffer.size() == 0) null else buffer.toString("UTF-8")
+            if (b == '\n'.code) return buffer.toString("UTF-8")
+            buffer.write(b)
+        }
+    }
+
+    // ===== ПРИЕМ СЕТИ: ТЕКСТ И ФАЙЛЫ =====
     private suspend fun listenForMessages(socket: Socket) {
-        val reader = BufferedReader(InputStreamReader(inputStream))
+        val input = socket.getInputStream()
         try {
             while (true) {
-                val line = reader.readLine() ?: break
-                
+                val line = readLineRaw(input) ?: break
+
                 if (line.startsWith("[FILE]")) {
                     val info = line.removePrefix("[FILE]").split("|")
                     val fileName = info[0]
-                    val size = info[1].toInt()
-                    
-                    val buffer = ByteArray(size)
-                    var bytesRead = 0
-                    while (bytesRead < size) {
-                        val result = inputStream?.read(buffer, bytesRead, size - bytesRead) ?: -1
-                        if (result == -1) break
-                        bytesRead += result
+                    var remaining = info[1].toLong()
+
+                    val file = File(appContext.filesDir, fileName)
+                    file.outputStream().use { out ->
+                        val buf = ByteArray(8192)
+                        while (remaining > 0) {
+                            val n = input.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                            if (n == -1) break
+                            out.write(buf, 0, n)
+                            remaining -= n
+                        }
                     }
-                    
-                    val file = saveFileFromBytes(buffer, fileName)
                     withContext(Dispatchers.Main) {
-                        addMessage(null, false, file.absolutePath)
+                        addMessage(null, false, file.absolutePath, fileName, file.length())
                     }
                 } else {
-                    withContext(Dispatchers.Main) {
-                        addMessage(line, false)
-                    }
+                    withContext(Dispatchers.Main) { addMessage(line, false) }
                 }
             }
         } catch (_: Exception) {
@@ -189,16 +228,14 @@ class ChatViewModel : ViewModel() {
         addMessage(text, true)
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                if (outputStream != null) {
-                    outputStream?.write((text + "\n").toByteArray(Charsets.UTF_8))
-                    outputStream?.flush()
-                }
+                outputStream?.write((text + "\n").toByteArray(Charsets.UTF_8))
+                outputStream?.flush()
             } catch (_: Exception) {}
         }
     }
 
-    private fun addMessage(text: String?, isMine: Boolean, imagePath: String? = null) {
-        _messages.value = _messages.value + Message(text, isMine, imagePath)
+    private fun addMessage(text: String?, isMine: Boolean, filePath: String? = null, fileName: String? = null, fileSize: Long = 0L) {
+        _messages.value = _messages.value + Message(text, isMine, filePath, fileName, fileSize)
     }
 
     override fun onCleared() {
