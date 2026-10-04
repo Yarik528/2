@@ -1,5 +1,7 @@
 package com.example.wifichat
 
+import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -8,14 +10,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.PrintWriter
+import java.io.*
 import java.net.ServerSocket
 import java.net.Socket
 
-// Модель сообщения для UI
-data class Message(val text: String, val isMine: Boolean)
+data class Message(val text: String?, val isMine: Boolean, val imageUri: String? = null)
 
 class ChatViewModel : ViewModel() {
 
@@ -27,157 +26,197 @@ class ChatViewModel : ViewModel() {
 
     private var serverSocket: ServerSocket? = null
     private var clientSocket: Socket? = null
-    private var outStream: PrintWriter? = null
     
-    // Флаг, чтобы бот не отвечал, если подключился реальный человек
+    // Используем потоки байтов напрямую, а не PrintWriter
+    private var outputStream: OutputStream? = null
+    private var inputStream: InputStream? = null
+    
     private var isBotActive = false
+    private lateinit var appContext: Context
 
-    // --- ЛОГИКА СЕРВЕРА (ХОСТ) + ТЕСТОВЫЙ БОТ ---
+    fun init(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    // --- ОТПРАВКА ФАЙЛА ---
+    fun sendFile(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val inputStreamFile = appContext.contentResolver.openInputStream(uri) ?: return@launch
+                val bytes = inputStreamFile.use { it.readBytes() }
+                
+                // Получаем имя файла
+                var fileName = "photo_${System.currentTimeMillis()}.jpg"
+                appContext.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) fileName = cursor.getString(0)
+                }
+
+                // 1. Показываем у себя
+                withContext(Dispatchers.Main) {
+                    // Сохраняем локально, чтобы отобразить
+                    val localFile = saveFileFromBytes(bytes, fileName)
+                    addMessage(null, true, localFile.absolutePath)
+                }
+
+                // 2. Отправляем по сети
+                if (outStream != null) {
+                    val header = "[FILE]$fileName|${bytes.size}\n"
+                    outputStream?.write(header.toByteArray(Charsets.UTF_8))
+                    outputStream?.write(bytes)
+                    outputStream?.flush()
+                } else if (isBotActive) {
+                    // Эмуляция бота: возвращаем картинку обратно через 1 сек
+                    delay(1000)
+                    withContext(Dispatchers.Main) {
+                        val botFile = saveFileFromBytes(bytes, "bot_$fileName")
+                        addMessage("🤖 Бот: Классное фото! Лови обратно.", false, botFile.absolutePath)
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    // Сохранение байтов во внутреннюю память приложения
+    private fun saveFileFromBytes(bytes: ByteArray, fileName: String): File {
+        val file = File(appContext.filesDir, fileName)
+        file.outputStream().use { it.write(bytes) }
+        return file
+    }
+
+    // --- ЛОГИКА СЕРВЕРА (ХОСТ) ---
     fun startAsHost() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 serverSocket = ServerSocket(5000)
-                
-                // Сразу переключаем экран на чат
                 withContext(Dispatchers.Main) {
                     _isConnected.value = true
-                    addMessage("Режим Хоста активирован. Ожидание подключения...", false)
+                    addMessage("Режим Хоста. Ожидание...", false)
                 }
 
-                // Запускаем ожидание реального подключения в отдельном потоке
                 launch {
                     try {
                         val socket = serverSocket!!.accept()
-                        // Если кто-то реально подключился, отключаем бота
-                        isBotActive = false 
-                        
+                        isBotActive = false
                         setupStreams(socket)
-                        withContext(Dispatchers.Main) {
-                            addMessage("✅ Друг реально подключился по Wi-Fi!", false)
-                        }
+                        withContext(Dispatchers.Main) { addMessage("✅ Друг подключился!", false) }
                         listenForMessages(socket)
-                    } catch (e: Exception) {
-                        // Игнорируем ошибку, если сокет закрылся принудительно
-                    }
+                    } catch (_: Exception) {}
                 }
 
-                // === ТЕСТОВЫЙ РЕЖИМ (ЭХО-БОТ) ===
-                // Ждем 3 секунды. Если никто не подключился, включаем бота для проверки UI
                 delay(3000)
-                
-                // Проверяем, не подключился ли кто-то за эти 3 секунды
-                if (clientSocket == null && outStream == null) {
+                if (clientSocket == null && outputStream == null) {
                     isBotActive = true
                     withContext(Dispatchers.Main) {
-                        addMessage("🤖 Тестовый бот: Никого нет рядом. Я здесь! Пиши сообщения, я буду отвечать, чтобы ты проверил дизайн.", false)
+                        addMessage("🤖 Бот активен. Можешь слать текст и картинки!", false)
                     }
-                    
-                    // Запускаем слежение за твоими сообщениями
                     launch {
                         messages.collect { list ->
-                            if (!isBotActive) return@collect // Если бот выключен, выходим
-                            
+                            if (!isBotActive) return@collect
                             val lastMsg = list.lastOrNull()
-                            if (lastMsg != null && lastMsg.isMine) {
-                                delay(800) // Небольшая задержка для реалистичности "печатания"
+                            if (lastMsg != null && lastMsg.isMine && lastMsg.text != null) {
+                                delay(800)
                                 withContext(Dispatchers.Main) {
-                                    addMessage("🤖 Бот: Ты написал '${lastMsg.text}'. Интерфейс работает отлично!", false)
+                                    addMessage("🤖 Бот: Ты написал '${lastMsg.text}'.", false)
                                 }
                             }
                         }
                     }
                 }
-                
             } catch (e: Exception) {
                 e.printStackTrace()
-                withContext(Dispatchers.Main) {
-                    addMessage("Ошибка сервера: ${e.message}", false)
-                }
             }
         }
     }
 
-    // --- ЛОГИКА КЛИЕНТА (ДРУГ) ---
+    // --- ЛОГИКА КЛИЕНТА ---
     fun startAsClient(hostIp: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val socket = Socket(hostIp, 5000)
                 clientSocket = socket
                 setupStreams(socket)
-                
                 withContext(Dispatchers.Main) {
                     _isConnected.value = true
-                    addMessage("✅ Вы подключились к хосту!", false)
+                    addMessage("✅ Подключено к хосту!", false)
                 }
-                
                 listenForMessages(socket)
             } catch (e: Exception) {
-                e.printStackTrace()
                 withContext(Dispatchers.Main) {
                     _isConnected.value = false
-                    addMessage("❌ Ошибка подключения: ${e.message}", false)
+                    addMessage("❌ Ошибка: ${e.message}", false)
                 }
             }
         }
     }
 
-    // --- ОБЩИЕ ФУНКЦИИ ---
-    
-    // Настраиваем потоки чтения и записи для сокета
     private fun setupStreams(socket: Socket) {
-        outStream = PrintWriter(socket.getOutputStream(), true)
+        outputStream = BufferedOutputStream(socket.getOutputStream())
+        inputStream = BufferedInputStream(socket.getInputStream())
     }
 
-    // Бесконечный цикл чтения входящих сообщений по сети
+    // --- ЧТЕНИЕ СЕТИ (ТЕКСТ И ФАЙЛЫ) ---
     private suspend fun listenForMessages(socket: Socket) {
-        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+        val reader = BufferedReader(InputStreamReader(inputStream))
         try {
             while (true) {
-                val message = reader.readLine() ?: break // Если null - соединение разорвано
-                withContext(Dispatchers.Main) {
-                    addMessage(message, false)
+                val line = reader.readLine() ?: break
+                
+                if (line.startsWith("[FILE]")) {
+                    // Формат: [FILE]name.jpg|12345
+                    val info = line.removePrefix("[FILE]").split("|")
+                    val fileName = info[0]
+                    val size = info[1].toInt()
+                    
+                    // Читаем ровно size байт
+                    val buffer = ByteArray(size)
+                    var bytesRead = 0
+                    while (bytesRead < size) {
+                        val result = inputStream?.read(buffer, bytesRead, size - bytesRead) ?: -1
+                        if (result == -1) break
+                        bytesRead += result
+                    }
+                    
+                    val file = saveFileFromBytes(buffer, fileName)
+                    withContext(Dispatchers.Main) {
+                        addMessage(null, false, file.absolutePath)
+                    }
+                } else {
+                    // Обычный текст
+                    withContext(Dispatchers.Main) {
+                        addMessage(line, false)
+                    }
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Exception) {
         } finally {
             withContext(Dispatchers.Main) {
                 _isConnected.value = false
-                addMessage("⚠️ Соединение разорвано.", false)
+                addMessage(" Соединение разорвано.", false)
             }
         }
     }
 
-    // Отправка сообщения
     fun sendMessage(text: String) {
-        // Добавляем в свой UI сразу
         addMessage(text, true)
-        
-        // Отправляем по сети (если есть реальное подключение)
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                outStream?.println(text)
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+                if (outputStream != null) {
+                    outputStream?.write((text + "\n").toByteArray(Charsets.UTF_8))
+                    outputStream?.flush()
+                }
+            } catch (_: Exception) {}
         }
     }
 
-    // Обновление списка сообщений
-    private fun addMessage(text: String, isMine: Boolean) {
-        _messages.value = _messages.value + Message(text, isMine)
+    private fun addMessage(text: String?, isMine: Boolean, imagePath: String? = null) {
+        _messages.value = _messages.value + Message(text, isMine, imagePath)
     }
 
-    // Очистка ресурсов при закрытии приложения
     override fun onCleared() {
         super.onCleared()
         isBotActive = false
-        try {
-            serverSocket?.close()
-            clientSocket?.close()
-            outStream?.close()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        try { serverSocket?.close(); clientSocket?.close(); outputStream?.close() } catch (_: Exception) {}
     }
 }
