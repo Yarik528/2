@@ -67,7 +67,7 @@ fun ConnectionScreen(
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text = "📡 WiFi Mesh Chat",
+            text = "Локальный мессенджер",
             color = Color.Cyan,
             fontSize = 28.sp,
             fontWeight = FontWeight.Bold
