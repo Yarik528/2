@@ -1,7 +1,12 @@
 package com.example.wifichat
 
 import android.content.Context
+import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -41,19 +46,50 @@ class ChatViewModel : ViewModel() {
 
     private var isBotActive = false
     private lateinit var appContext: Context
+    lateinit var settings: SettingsManager
 
     fun init(context: Context) {
         appContext = context.applicationContext
+        settings = SettingsManager(appContext)
     }
 
-    // ===== ОТПРАВКА ЛЮБОГО ФАЙЛА (фото, видео, документы) =====
+    // Вибрация
+    private fun vibrate() {
+        if (!settings.vibrationEnabled) return
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val manager = appContext.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                manager.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                appContext.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            }
+            vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        } catch (_: Exception) {}
+    }
+
+    // Звук
+    private fun playSound() {
+        if (!settings.soundEnabled) return
+        try {
+            val mp = MediaPlayer.create(appContext, android.provider.Settings.System.DEFAULT_NOTIFICATION_URI)
+            mp?.setOnCompletionListener { it.release() }
+            mp?.start()
+        } catch (_: Exception) {}
+    }
+
+    fun notifyIncoming() {
+        vibrate()
+        playSound()
+    }
+
+    // ===== ОТПРАВКА ФАЙЛА =====
     fun sendFile(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val fileName = getFileName(uri)
                 val localFile = File(appContext.filesDir, fileName)
 
-                // Сохраняем у себя, чтобы показать в чате
                 val size = appContext.contentResolver.openInputStream(uri)?.use { input ->
                     localFile.outputStream().use { out -> input.copyTo(out) }
                     localFile.length()
@@ -64,7 +100,6 @@ class ChatViewModel : ViewModel() {
                 }
 
                 if (outputStream != null) {
-                    // Реальная отправка: заголовок + байты частями (не грузим всё в память)
                     val header = "[FILE]$fileName|$size\n"
                     outputStream?.write(header.toByteArray(Charsets.UTF_8))
                     localFile.inputStream().use { input ->
@@ -105,7 +140,7 @@ class ChatViewModel : ViewModel() {
         else -> String.format("%.1f МБ", bytes / (1024.0 * 1024.0))
     }
 
-    // ===== СЕРВЕР (ХОСТ) =====
+    // ===== СЕРВЕР =====
     fun startAsHost() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -175,7 +210,6 @@ class ChatViewModel : ViewModel() {
         outputStream = BufferedOutputStream(socket.getOutputStream())
     }
 
-    // Читаем строку ПОБАЙТОВО (без BufferedReader), чтобы не ломать передачу файлов
     private fun readLineRaw(input: InputStream): String? {
         val buffer = ByteArrayOutputStream()
         while (true) {
@@ -186,7 +220,6 @@ class ChatViewModel : ViewModel() {
         }
     }
 
-    // ===== ПРИЕМ СЕТИ: ТЕКСТ И ФАЙЛЫ =====
     private suspend fun listenForMessages(socket: Socket) {
         val input = socket.getInputStream()
         try {
@@ -209,10 +242,14 @@ class ChatViewModel : ViewModel() {
                         }
                     }
                     withContext(Dispatchers.Main) {
+                        notifyIncoming()
                         addMessage(null, false, file.absolutePath, fileName, file.length())
                     }
                 } else {
-                    withContext(Dispatchers.Main) { addMessage(line, false) }
+                    withContext(Dispatchers.Main) {
+                        notifyIncoming()
+                        addMessage(line, false)
+                    }
                 }
             }
         } catch (_: Exception) {
@@ -236,6 +273,10 @@ class ChatViewModel : ViewModel() {
 
     private fun addMessage(text: String?, isMine: Boolean, filePath: String? = null, fileName: String? = null, fileSize: Long = 0L) {
         _messages.value = _messages.value + Message(text, isMine, filePath, fileName, fileSize)
+    }
+
+    fun clearHistory() {
+        _messages.value = emptyList()
     }
 
     override fun onCleared() {
