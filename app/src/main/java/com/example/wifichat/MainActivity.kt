@@ -7,6 +7,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -27,21 +28,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.rememberAsyncImagePainter
 import java.io.File
 
 class MainActivity : ComponentActivity() {
     
-    // Лаунчер для выбора фото
-    private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        uri?.let {
-            // Передаем URI в ViewModel
-            (viewModel as? ChatViewModel)?.sendFile(it)
-            // Хак: получаем VM через глобальный скоуп (для простоты без DI)
-            MainViewModelHolder.vm?.sendFile(it)
-        }
-    }
+    // Используем viewModels() для Activity
+    private val vm: ChatViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -55,20 +48,11 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                // Создаем VM и сохраняем ссылку для лаунчера
-                val vm: ChatViewModel = viewModel()
-                MainViewModelHolder.vm = vm
                 vm.init(applicationContext)
-                
                 WifiChatApp(vm)
             }
         }
     }
-}
-
-// Глобальный холдер, чтобы Activity могла передать файл в VM из лаунчера
-object MainViewModelHolder {
-    var vm: ChatViewModel? = null
 }
 
 @Composable
@@ -104,7 +88,6 @@ fun ConnectionScreen(ipInput: String, onIpChange: (String) -> Unit, onStartHost:
 fun ChatScreen(viewModel: ChatViewModel) {
     val messages by viewModel.messages.collectAsState()
     var inputText by remember { mutableStateOf("") }
-    val context = LocalContext.current
 
     // Лаунчер выбора фото внутри Compose
     val pickImageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -122,7 +105,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
 
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             
-            // КНОПКА СКРЕПКА (ВЫБОР ФОТО)
             IconButton(onClick = { pickImageLauncher.launch("image/*") }) {
                 Icon(Icons.Default.AttachFile, contentDescription = "Attach", tint = Color.Cyan, modifier = Modifier.size(30.dp))
             }
@@ -154,7 +136,6 @@ fun MessageBubble(message: Message) {
             ).padding(12.dp)
         ) {
             if (message.imageUri != null) {
-                // Отображаем картинку с помощью Coil
                 Image(
                     painter = rememberAsyncImagePainter(File(message.imageUri)),
                     contentDescription = "Image",
