@@ -1,6 +1,8 @@
 package com.example.wifichat
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -11,6 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -18,7 +21,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -26,21 +28,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import android.webkit.MimeTypeMap
 import coil.compose.rememberAsyncImagePainter
-import kotlinx.coroutines.launch
 import java.io.File
 
 class MainActivity : ComponentActivity() {
+
     private val vm: ChatViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(Manifest.permission.READ_MEDIA_IMAGES), 100)
@@ -89,23 +93,18 @@ fun ConnectionScreen(ipInput: String, onIpChange: (String) -> Unit, onStartHost:
 fun ChatScreen(viewModel: ChatViewModel) {
     val messages by viewModel.messages.collectAsState()
     var inputText by remember { mutableStateOf("") }
-    
-    // 1. СОСТОЯНИЕ СКРОЛЛА ДЛЯ АВТОПРОКРУТКИ
     val listState = rememberLazyListState()
-    val coroutineScope = rememberCoroutineScope()
 
-    // 2. УНИВЕРСАЛЬНЫЙ ЛАУНЧЕР ДЛЯ ЛЮБЫХ ФАЙЛОВ
-    val pickFileLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let { viewModel.sendFile(it) }
-    }
-
-    // 3. АВТОМАТИЧЕСКАЯ ПРОКРУТКА ВНИЗ ПРИ НОВОМ СООБЩЕНИИ
+    // ✅ АВТОПРОКРУТКА ВНИЗ при каждом новом сообщении
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.size - 1)
         }
+    }
+
+    // ✅ Теперь открывает ЛЮБЫЕ файлы, не только картинки
+    val pickFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let { viewModel.sendFile(it) }
     }
 
     Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(top = 40.dp)) {
@@ -113,19 +112,17 @@ fun ChatScreen(viewModel: ChatViewModel) {
             Text("🟢 Подключено | Локальный чат", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
         }
 
-        // Передаем listState в LazyColumn
         LazyColumn(
             state = listState,
-            modifier = Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 8.dp), 
+            modifier = Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(messages) { msg -> MessageBubble(msg) }
         }
 
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            
-            // Кнопка теперь открывает любые файлы
-            IconButton(onClick = { pickFileLauncher.launch(arrayOf("*/*")) }) {
+
+            IconButton(onClick = { pickFileLauncher.launch("*/*") }) {
                 Icon(Icons.Default.AttachFile, contentDescription = "Attach", tint = Color.Cyan, modifier = Modifier.size(30.dp))
             }
 
@@ -148,6 +145,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
 
 @Composable
 fun MessageBubble(message: Message) {
+    val context = LocalContext.current
+
     Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.isMine) Arrangement.End else Arrangement.Start) {
         Box(
             Modifier.widthIn(max = 260.dp).background(
@@ -156,43 +155,66 @@ fun MessageBubble(message: Message) {
             ).padding(12.dp)
         ) {
             when {
-                // Если это картинка (jpg, png, webp) - показываем изображение
-                message.imageUri != null && (message.imageUri.endsWith(".jpg", true) || 
-                                             message.imageUri.endsWith(".jpeg", true) || 
-                                             message.imageUri.endsWith(".png", true) || 
-                                             message.imageUri.endsWith(".webp", true)) -> {
+                // Картинка -> показываем превью
+                message.filePath != null && isImage(message.filePath) -> {
                     Image(
-                        painter = rememberAsyncImagePainter(File(message.imageUri)),
-                        contentDescription = "Image",
+                        painter = rememberAsyncImagePainter(File(message.filePath)),
+                        contentDescription = null,
                         modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp),
                         contentScale = ContentScale.Crop
                     )
                 }
-                // Если это другой файл (pdf, apk, zip и т.д.) - показываем иконку и имя
-                message.imageUri != null -> {
-                    val fileName = File(message.imageUri).name
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.Description, 
-                            contentDescription = "File", 
-                            tint = Color.White,
-                            modifier = Modifier.size(32.dp)
-                        )
+                // Видео или документ -> карточка файла, тап = открыть
+                message.filePath != null -> {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clickable { openFile(context, message) }
+                    ) {
+                        Text(if (isVideo(message.filePath)) "🎬" else "📄", fontSize = 28.sp)
                         Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = fileName, 
-                            color = Color.White, 
-                            fontSize = 14.sp,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        Column {
+                            Text(message.fileName ?: "Файл", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Text(formatFileSize(message.fileSize), color = Color.LightGray, fontSize = 12.sp)
+                        }
                     }
                 }
                 // Обычный текст
-                else -> {
-                    Text(text = message.text ?: "", color = Color.White, fontSize = 16.sp)
-                }
+                else -> Text(text = message.text ?: "", color = Color.White, fontSize = 16.sp)
             }
         }
+    }
+}
+
+// ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+
+fun isImage(path: String): Boolean {
+    val ext = path.substringAfterLast('.', "").lowercase()
+    return ext in listOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif")
+}
+
+fun isVideo(path: String): Boolean {
+    val ext = path.substringAfterLast('.', "").lowercase()
+    return ext in listOf("mp4", "mkv", "webm", "3gp", "mov", "avi")
+}
+
+fun formatFileSize(bytes: Long): String = when {
+    bytes < 1024 -> "$bytes Б"
+    bytes < 1024 * 1024 -> "${bytes / 1024} КБ"
+    else -> String.format("%.1f МБ", bytes / (1024.0 * 1024.0))
+}
+
+// Открытие файла в стороннем приложении (плеер, PDF-ридер и т.д.)
+fun openFile(context: Context, message: Message) {
+    try {
+        val file = File(message.filePath ?: return)
+        val uri = FileProvider.getUriForFile(context, context.packageName + ".provider", file)
+        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "Открыть файл"))
+    } catch (e: Exception) {
+        e.printStackTrace()
     }
 }
